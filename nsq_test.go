@@ -1,61 +1,83 @@
 package nsqt
 
 import (
+	"bytes"
+	"fmt"
 	"github.com/bitly/nsq/nsq"
+	"net/http"
 	"testing"
+	"time"
 )
 
-type TestHander struct {
+const (
+	test_topic = "test_topic"
+)
+
+type CallbackHandler struct {
 	t *testing.T
 	q *nsq.Reader
 
-	handleMessage chan *nsq.Message
+	handleMsg func(message *nsq.Message, finish chan *nsq.FinishedMessage)
 }
 
-func (handler TestHander) HandleMessage(message *nsq.Message) error {
-	handler.handleMessage <- message
-	return nil
-}
-
-func (handler TestHander) Stop() {
-	handler.q.Stop()
-	<-handler.q.ExitChan
+func (handler CallbackHandler) HandleMessage(message *nsq.Message, finish chan *nsq.FinishedMessage) {
+	handler.handleMsg(message, finish)
 }
 
 func TestClientCanSendSomething(t *testing.T) {
-	qClient1, err := createTestReader(t)
-	qClient2, err := createTestReader(t)
-	defer qClient1.Stop()
-	defer qClient2.Stop()
+	received := make([]*nsq.Message, 0)
 
-	if err != nil {
-		t.Fatalf("error while creating client: %v", err.Error())
+	qClient1 := createTestReaderOrFail(t, func(msg *nsq.Message, finish chan *nsq.FinishedMessage) {
+		t.Logf("c1 received %s", msg)
+
+		received = append(received, msg)
+	})
+
+	SendMessage(t, 4151, test_topic, "put", []byte(`{"msg":"single"}`))
+
+	time.Sleep(6 * 2 * time.Second)
+
+	qClient1.q.Stop()
+
+	for i := 0; i < len(received); i++ {
+		t.Logf("msg %v has attemp %v", received[i].Id, received[i].Attempts)
 	}
 }
 
-func stopClient(handler TestHander) {
-	handler.q.Stop()
-	<-handler.q.ExitChan
+func SendMessage(t *testing.T, port int, topic string, method string, body []byte) {
+	httpclient := &http.Client{}
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/%s?topic=%s", port, method, topic)
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(body))
+	resp, err := httpclient.Do(req)
+	if err != nil {
+		t.Fatalf(err.Error())
+		return
+	}
+	resp.Body.Close()
 }
 
-func createTestReader(t *testing.T) (*TestHander, error) {
+func createTestReaderOrFail(t *testing.T, handleMsg func(message *nsq.Message, finish chan *nsq.FinishedMessage)) *CallbackHandler {
 	addr := "127.0.0.1:4150"
-	topicName := "reader_test"
-	q, _ := nsq.NewReader(topicName, "ch")
+	q, err := nsq.NewReader(test_topic, "ch")
+
+	if err != nil {
+		t.Fatalf("couldn't create reader: %v", err.Error())
+	}
+
 	q.VerboseLogging = true
 
-	handler := &TestHander{
-		t:             t,
-		q:             q,
-		handleMessage: make(chan *nsq.Message),
+	handler := &CallbackHandler{
+		t:         t,
+		q:         q,
+		handleMsg: handleMsg,
 	}
 
-	q.AddHandler(handler)
+	q.AddAsyncHandler(handler)
 
-	err := q.ConnectToNSQ(addr)
+	err = q.ConnectToNSQ(addr)
 	if err != nil {
-		return nil, err
+		t.Fatal(err.Error())
 	}
 
-	return handler, nil
+	return handler
 }
